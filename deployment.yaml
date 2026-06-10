@@ -1,0 +1,19 @@
+# ============================================================
+# CloudFormation GitSync Deployment File
+# 
+# This file tells AWS CloudFormation:
+# - Which template file to use
+# - What the stack should be called
+# - What parameters to use
+#
+# When you push changes to GitHub, AWS automatically
+# re-deploys the stack with the latest template.
+# ============================================================
+
+template-file-path: ./template.yaml
+
+stack-name: AutoScalingLab
+
+parameters:
+  - parameter-key: LatestAmiId
+    parameter-value: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64

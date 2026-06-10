@@ -1,0 +1,435 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Auto Scaling Lab - Highly available, auto-scaling web tier using EC2 Auto Scaling
+  and an Application Load Balancer (ALB). Includes VPC, public/private subnets,
+  NAT Gateway, ALB, ASG, Launch Template, and Target Tracking scaling policy.
+
+# ============================================================
+# PARAMETERS
+# ============================================================
+Parameters:
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: >
+      Automatically fetches the latest Amazon Linux 2023 AMI for the current region.
+      You do NOT need to change this.
+
+# ============================================================
+# VPC AND NETWORKING
+# ============================================================
+Resources:
+
+  # --- VPC ---
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: AutoScalingLabVPC
+
+  # --- Internet Gateway (the door to the internet) ---
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: AutoScalingLabIGW
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # ============================================================
+  # PUBLIC SUBNETS (for ALB) - one in each Availability Zone
+  # ============================================================
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: PublicSubnet-AZ1
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: PublicSubnet-AZ2
+
+  # ============================================================
+  # PRIVATE SUBNETS (for EC2 instances) - one in each AZ
+  # ============================================================
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.3.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: PrivateSubnet-AZ1
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.4.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: PrivateSubnet-AZ2
+
+  # ============================================================
+  # PUBLIC ROUTE TABLE (routes public subnet traffic to IGW)
+  # ============================================================
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: PublicRouteTable
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  # ============================================================
+  # NAT GATEWAY (lets private instances reach internet, but
+  # nobody can reach private instances from outside)
+  # ============================================================
+  NatEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: AttachGateway
+    Properties:
+      Domain: vpc
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: AutoScalingLabNATGW
+
+  # ============================================================
+  # PRIVATE ROUTE TABLE (routes private subnet traffic to NAT GW)
+  # ============================================================
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: PrivateRouteTable
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnet1RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  # ============================================================
+  # SECURITY GROUPS
+  # ============================================================
+
+  # ALB Security Group - allows HTTP from the internet
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP from internet to ALB
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: ALB-SG
+
+  # EC2 Security Group - only allows traffic from the ALB, NO direct SSH
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP from ALB only. No SSH.
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+      Tags:
+        - Key: Name
+          Value: EC2-SG
+
+  # ============================================================
+  # APPLICATION LOAD BALANCER (ALB)
+  # ============================================================
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: AutoScalingLabALB
+      Scheme: internet-facing
+      Type: application
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Tags:
+        - Key: Name
+          Value: AutoScalingLabALB
+
+  # Target Group - the list of EC2 instances the ALB sends traffic to
+  ALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: AutoScalingLabTG
+      Protocol: HTTP
+      Port: 80
+      VpcId: !Ref VPC
+      TargetType: instance
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /
+      HealthCheckIntervalSeconds: 15
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Tags:
+        - Key: Name
+          Value: AutoScalingLabTG
+
+  # Listener - the ALB "ear" that listens on port 80 and forwards to target group
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Protocol: HTTP
+      Port: 80
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ALBTargetGroup
+
+  # ============================================================
+  # IAM ROLE FOR EC2 (allows SSM Session Manager - no SSH needed)
+  # ============================================================
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: AutoScalingLabEC2Role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - Key: Name
+          Value: AutoScalingLabEC2Role
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: AutoScalingLabInstanceProfile
+      Roles:
+        - !Ref EC2InstanceRole
+
+  # ============================================================
+  # LAUNCH TEMPLATE
+  # Defines what each new EC2 instance looks like when created.
+  # UserData is the startup script - runs when instance boots.
+  # ============================================================
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: AutoScalingLabLT
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: t2.micro
+        IamInstanceProfile:
+          Name: !Ref EC2InstanceProfile
+        SecurityGroupIds:
+          - !Ref EC2SecurityGroup
+        # No KeyName = no SSH access (as required)
+        UserData:
+          # This script runs when each EC2 boots up:
+          # 1. Installs Apache web server
+          # 2. Starts Apache
+          # 3. Creates an HTML page showing THIS instance's ID and IP
+          Fn::Base64: |
+            #!/bin/bash
+            yum update -y
+            yum install -y httpd stress
+            systemctl start httpd
+            systemctl enable httpd
+
+            # Get instance metadata
+            TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" \
+              -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+            INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+              http://169.254.169.254/latest/meta-data/instance-id)
+            PRIVATE_IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+              http://169.254.169.254/latest/meta-data/local-ipv4)
+            AZ=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" \
+              http://169.254.169.254/latest/meta-data/placement/availability-zone)
+
+            # Create the web page
+            cat > /var/www/html/index.html << EOF
+            <!DOCTYPE html>
+            <html>
+            <head>
+              <title>Auto Scaling Lab</title>
+              <style>
+                body { font-family: Arial, sans-serif; text-align: center; margin-top: 80px; background: #f0f4f8; }
+                .card { background: white; border-radius: 12px; padding: 40px; display: inline-block;
+                        box-shadow: 0 4px 20px rgba(0,0,0,0.1); max-width: 500px; }
+                h1 { color: #232f3e; }
+                .badge { background: #ff9900; color: white; border-radius: 8px;
+                         padding: 6px 16px; font-size: 14px; }
+                .info { margin: 12px 0; font-size: 18px; }
+                .label { font-weight: bold; color: #555; }
+              </style>
+            </head>
+            <body>
+              <div class="card">
+                <h1>&#x2601; Auto Scaling Lab</h1>
+                <span class="badge">AWS EC2 Auto Scaling</span>
+                <div class="info"><span class="label">Instance ID:</span> $INSTANCE_ID</div>
+                <div class="info"><span class="label">Private IP:</span> $PRIVATE_IP</div>
+                <div class="info"><span class="label">Availability Zone:</span> $AZ</div>
+                <hr/>
+                <p style="color:#888">Refresh this page to see load balancing route you to a different instance!</p>
+              </div>
+            </body>
+            </html>
+            EOF
+
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: AutoScalingLabInstance
+
+  # ============================================================
+  # AUTO SCALING GROUP (ASG)
+  # Min=1, Desired=1, Max=4
+  # Spans both private subnets (multi-AZ for high availability)
+  # ============================================================
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn: NatGateway
+    Properties:
+      AutoScalingGroupName: AutoScalingLabASG
+      MinSize: '1'
+      DesiredCapacity: '1'
+      MaxSize: '4'
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      VPCZoneIdentifier:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      TargetGroupARNs:
+        - !Ref ALBTargetGroup
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 120
+      Tags:
+        - Key: Name
+          Value: AutoScalingLabASG
+          PropagateAtLaunch: true
+
+  # ============================================================
+  # SCALING POLICY - Target Tracking on CPU
+  # Automatically adds instances when avg CPU > 30%
+  # Automatically removes instances when CPU drops back down
+  # ============================================================
+  CPUScalingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: 30.0
+        # ScaleInCooldown: how long to wait before removing an instance (seconds)
+        ScaleInCooldown: 120
+        # ScaleOutCooldown: how long to wait before adding another instance (seconds)
+        ScaleOutCooldown: 60
+        DisableScaleIn: false
+
+# ============================================================
+# OUTPUTS - Values shown after stack deploys
+# ============================================================
+Outputs:
+  ALBDNS:
+    Description: >
+      Paste this URL into your browser to access the application.
+      Refresh multiple times to see different instance IDs (load balancing in action).
+    Value: !Sub 'http://${ApplicationLoadBalancer.DNSName}'
+    Export:
+      Name: AutoScalingLabALBDNS
+
+  VPCId:
+    Description: VPC ID
+    Value: !Ref VPC
+    Export:
+      Name: AutoScalingLabVPCId
+
+  ASGName:
+    Description: Auto Scaling Group name (use this to monitor in AWS Console)
+    Value: !Ref AutoScalingGroup
+    Export:
+      Name: AutoScalingLabASGName
+
+  NATGatewayId:
+    Description: NAT Gateway ID
+    Value: !Ref NatGateway
