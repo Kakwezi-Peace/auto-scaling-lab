@@ -1,4 +1,4 @@
-template-file-path: ./template.yaml
+template-file-path: template.yaml
 parameters:
   - parameter-key: LatestAmiId
     parameter-value: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
