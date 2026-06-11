@@ -250,7 +250,7 @@ Resources:
       LaunchTemplateName: AutoScalingLabLT
       LaunchTemplateData:
         ImageId: !Ref LatestAmiId
-        InstanceType: t2.micro
+        InstanceType: t3.micro
         IamInstanceProfile:
           Name: !Ref EC2InstanceProfile
         SecurityGroupIds:
